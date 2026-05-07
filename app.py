@@ -13,7 +13,7 @@ def extract_m3u8(page_url):
     """Fetches the page and extracts the raw m3u8 stream link."""
     try:
         resp = cffi_requests.get(page_url, impersonate="chrome120", timeout=15)
-        html = resp.text
+        html = resp.tex
         stream_url = None
         data = {}
 
