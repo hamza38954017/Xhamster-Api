@@ -7,7 +7,7 @@ from urllib.parse import urljoin
 import m3u8
 
 app = Flask(__name__)
-CORS(app) # Allows requests from your PHP/JS frontends
+CORS(app)
 
 def extract_m3u8(page_url):
     """Fetches the page and extracts the raw m3u8 stream link."""
@@ -68,9 +68,19 @@ def parse_qualities(m3u8_url):
         print(f"Error parsing qualities: {str(e)}")
         return {}
 
+# --- ROUTES ---
+
+@app.route('/', methods=['GET'])
+def home():
+    """Root endpoint to verify the API is online."""
+    return jsonify({
+        "status": "online", 
+        "message": "API is running! Send POST or GET requests with a 'url' parameter to /api/extract"
+    }), 200
+
 @app.route('/api/extract', methods=['GET', 'POST'])
 def extract_video():
-    # Handle both GET (query parameters) and POST (JSON body)
+    """Main extraction endpoint."""
     if request.method == 'POST':
         data = request.get_json()
         target_url = data.get('url') if data else None
@@ -80,15 +90,16 @@ def extract_video():
     if not target_url:
         return jsonify({"success": False, "error": "No URL provided."}), 400
 
-    # Extract the master URL
+    # 1. Extract the master URL
     master_url = extract_m3u8(target_url)
 
     if not master_url:
         return jsonify({"success": False, "error": "Could not extract a valid .m3u8 link."}), 404
 
-    # Parse out the specific qualities
+    # 2. Parse out the specific qualities
     qualities = parse_qualities(master_url)
 
+    # 3. Return everything together
     return jsonify({
         "success": True,
         "master_url": master_url,
