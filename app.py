@@ -114,9 +114,16 @@ def extract_subtitles(html: str, data: dict) -> list[dict]:
 # ─────────────────────────────────────────────
 #  M3U8 EXTRACTION
 # ─────────────────────────────────────────────
-def extract_m3u8(page_url: str) -> tuple[str | None, list[dict], str]:
+def extract_m3u8(page_url: str, user_ip: str = None) -> tuple[str | None, list[dict], str]:
     try:
-        resp = cffi_requests.get(page_url, impersonate="chrome120", timeout=20)
+        headers = {}
+        # If we received a user IP from the PHP proxy, spoof it in the headers
+        if user_ip:
+            headers['X-Forwarded-For'] = user_ip
+            headers['Client-IP'] = user_ip
+
+        # Pass the headers to curl_cffi
+        resp = cffi_requests.get(page_url, impersonate="chrome120", timeout=20, headers=headers)
         html = resp.text
 
         data = {}
@@ -168,16 +175,24 @@ def home():
 @app.route('/api/extract', methods=['GET', 'POST'])
 def extract_endpoint():
     """Main extraction endpoint."""
+    user_ip = None
     if request.method == 'POST':
         payload = request.get_json()
         target_url = payload.get('url') if payload else None
+        user_ip = payload.get('user_ip') if payload else None
     else:
         target_url = request.args.get('url')
+        user_ip = request.args.get('user_ip')
+
+    # Fallback to the direct requester's IP if one wasn't passed in the payload
+    if not user_ip:
+        user_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
 
     if not target_url:
         return jsonify({"success": False, "error": "No URL provided."}), 400
 
-    stream_url, subtitles, _ = extract_m3u8(target_url)
+    # Pass the user_ip into the extraction function
+    stream_url, subtitles, _ = extract_m3u8(target_url, user_ip)
 
     if not stream_url and not subtitles:
         return jsonify({
