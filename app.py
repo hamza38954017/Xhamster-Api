@@ -3,193 +3,107 @@ import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from curl_cffi import requests as cffi_requests
+from urllib.parse import urljoin
+import m3u8
 
 app = Flask(__name__)
 CORS(app)
 
-# ─────────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────────
-def _clean_url(url: str) -> str:
-    return url.replace('\\/', '/').replace('\\u0026', '&')
-
-def _detect_sub_format(url: str) -> str:
-    """Handles versioned URLs like .vtt.v1733255317"""
-    path = url.lower().split("?")[0]
-    if re.search(r'\.vtt(\.|$|/)', path):
-        return "vtt"
-    if re.search(r'\.srt(\.|$|/)', path):
-        return "srt"
-    if re.search(r'\.(ass|ssa)(\.|$|/)', path):
-        return "ass"
-    if path.endswith(".html"):
-        return "html"
-    return "unknown"
-
-# ─────────────────────────────────────────────
-#  SUBTITLE EXTRACTION
-# ─────────────────────────────────────────────
-def extract_subtitles(html: str, data: dict) -> list[dict]:
-    subtitles = []
-    seen = set()
-
-    def add(label, language, url, fmt):
-        url = _clean_url(url)
-        if url and url not in seen:
-            seen.add(url)
-            subtitles.append({
-                "label": label, 
-                "language": language,
-                "url": url, 
-                "format": fmt
-            })
-
-    # ── Method 1: xplayerPluginSettings.subtitles.tracks ───────────────────
-    if data:
-        xplayer_subs = (
-            data.get("xplayerPluginSettings", {})
-            .get("subtitles", {})
-            .get("tracks", [])
-        )
-        for track in xplayer_subs:
-            label = track.get("label", "Subtitle")
-            language = track.get("lang", track.get("language", "und"))
-            urls = track.get("urls", {})
-
-            for fmt in ("vtt", "srt", "ass"):
-                url = urls.get(fmt, "")
-                if url:
-                    add(label, language, url, fmt)
-                    break
-            else:
-                for fmt, url in urls.items():
-                    if url:
-                        add(label, language, url, _detect_sub_format(url))
-
-    # ── Method 2: videoModel.tracks / textTracks ───────────────────────────
-    if data:
-        vm = data.get("videoModel", {})
-
-        def _iter_tracks(v):
-            if isinstance(v, list):
-                yield from v
-            elif isinstance(v, dict):
-                for k in ("subtitles", "captions", "closedCaptions", "text"):
-                    yield from v.get(k, [])
-
-        for track in _iter_tracks(vm.get("tracks")):
-            url = track.get("file") or track.get("src") or track.get("url", "")
-            if url:
-                add(track.get("label", "Subtitle"),
-                    track.get("language", track.get("lang", "und")),
-                    url, _detect_sub_format(url))
-
-        for track in vm.get("textTracks", []):
-            url = track.get("src") or track.get("url", "")
-            if url:
-                add(track.get("label", "Subtitle"),
-                    track.get("srclang", track.get("language", "und")),
-                    url, _detect_sub_format(url))
-
-    # ── Method 3: top-level captions / subtitles keys ──────────────────────
-    if data:
-        for key in ("captions", "subtitles", "closedCaptions"):
-            for item in data.get(key, []):
-                url = item.get("url") or item.get("src") or item.get("file", "")
-                if url:
-                    add(item.get("label", key),
-                        item.get("language", item.get("lang", "und")),
-                        url, _detect_sub_format(url))
-
-    # ── Method 4: regex sweep ──────────────────────────────────────────────
-    for url in re.findall(r'https?://[^\s<>"\'\\]+\.vtt(?:\.[^\s<>"\'\\]*)?', html, re.I):
-        add("VTT Subtitle", "und", url, "vtt")
-    for url in re.findall(r'https?:\\/\\/[^\s<>"\'\\]+\.vtt(?:\.[^\s<>"\'\\]*)?', html, re.I):
-        add("VTT Subtitle", "und", url, "vtt")
-    for url in re.findall(r'https?://[^\s<>"\'\\]+\.srt(?:\.[^\s<>"\'\\]*)?', html, re.I):
-        add("SRT Subtitle", "und", url, "srt")
-
-    return subtitles
-
-# ─────────────────────────────────────────────
-#  M3U8 EXTRACTION
-# ─────────────────────────────────────────────
-def extract_m3u8(page_url: str) -> tuple[str | None, list[dict], str]:
+def extract_m3u8(page_url):
+    """Fetches the page and extracts the raw m3u8 stream link."""
     try:
-        resp = cffi_requests.get(page_url, impersonate="chrome120", timeout=20)
+        resp = cffi_requests.get(page_url, impersonate="chrome120", timeout=15)
         html = resp.text
-
+        stream_url = None
         data = {}
-        m = re.search(r'window\.initials\s*=\s*(\{.+?\});\s*</script>', html, re.DOTALL)
-        if m:
+
+        # Method 1: Extract from window.initials JSON object
+        json_match = re.search(r'window\.initials\s*=\s*({.+?});\s*</script>', html, re.DOTALL)
+        if json_match:
             try:
-                data = json.loads(m.group(1))
+                data = json.loads(json_match.group(1))
             except json.JSONDecodeError:
                 pass
 
-        stream_url = None
-
         if data:
             sources = data.get("videoModel", {}).get("sources", {})
-            if isinstance(sources, dict):
-                stream_url = _clean_url(sources.get("hls", {}).get("url", "") or "")
+            if "hls" in sources:
+                stream_url = sources["hls"].get("url")
 
+        # Method 2: Fallback Regex for direct m3u8 links in HTML
         if not stream_url:
-            matches = [_clean_url(u) for u in
-                       re.findall(r'https?://[^\s<>"\'\\]+\.m3u8[^\s<>"\'\\]*', html)
-                       if 'tsyndicate' not in u]
-            if matches:
-                stream_url = matches[0]
+            m3u8_matches = re.findall(r'https?:\/\/[^\s<>"\'\\]+\.m3u8[^\s<>"\'\\]*', html)
+            if m3u8_matches:
+                valid = [m.replace('\\/', '/') for m in m3u8_matches if 'tsyndicate' not in m]
+                if valid:
+                    stream_url = valid[0]
 
-        if not stream_url:
-            escaped = re.findall(r'https?:\\/\\/[^\s<>"\'\\]+\.m3u8[^\s<>"\']*', html)
-            if escaped:
-                stream_url = _clean_url(escaped[0])
-
-        subtitles = extract_subtitles(html, data)
-        return stream_url, subtitles, html
-
+        return stream_url
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return None, [], ""
+        print(f"Error during extraction: {str(e)}")
+        return None
 
-# ─────────────────────────────────────────────
-#  API ROUTES
-# ─────────────────────────────────────────────
+def parse_qualities(m3u8_url):
+    """Fetches the master m3u8 and extracts different quality URLs."""
+    try:
+        resp = cffi_requests.get(m3u8_url, impersonate="chrome120", timeout=15)
+        playlist = m3u8.loads(resp.text)
+        
+        qualities = {}
+        # Check if it's a master playlist with multiple qualities
+        if playlist.is_variant:
+            for p in playlist.playlists:
+                # Determine resolution label (e.g., "1080p", "720p")
+                if p.stream_info.resolution:
+                    res_label = f"{p.stream_info.resolution[1]}p"
+                else:
+                    res_label = "unknown"
+                
+                # Ensure the URL is absolute
+                stream_uri = p.uri if p.uri.startswith('http') else urljoin(m3u8_url, p.uri)
+                qualities[res_label] = stream_uri
+                
+        return qualities
+    except Exception as e:
+        print(f"Error parsing qualities: {str(e)}")
+        return {}
+
+# --- ROUTES ---
+
 @app.route('/', methods=['GET'])
 def home():
     """Root endpoint to verify the API is online."""
     return jsonify({
         "status": "online", 
-        "message": "Send GET or POST requests with a 'url' parameter to /api/extract"
+        "message": "API is running! Send POST or GET requests with a 'url' parameter to /api/extract"
     }), 200
 
 @app.route('/api/extract', methods=['GET', 'POST'])
-def extract_endpoint():
+def extract_video():
     """Main extraction endpoint."""
     if request.method == 'POST':
-        payload = request.get_json()
-        target_url = payload.get('url') if payload else None
+        data = request.get_json()
+        target_url = data.get('url') if data else None
     else:
         target_url = request.args.get('url')
 
     if not target_url:
         return jsonify({"success": False, "error": "No URL provided."}), 400
 
-    stream_url, subtitles, _ = extract_m3u8(target_url)
+    # 1. Extract the master URL
+    master_url = extract_m3u8(target_url)
 
-    if not stream_url and not subtitles:
-        return jsonify({
-            "success": False, 
-            "error": "Could not extract stream or subtitles."
-        }), 404
+    if not master_url:
+        return jsonify({"success": False, "error": "Could not extract a valid .m3u8 link."}), 404
 
+    # 2. Parse out the specific qualities
+    qualities = parse_qualities(master_url)
+
+    # 3. Return everything together
     return jsonify({
         "success": True,
-        "stream_url": stream_url,
-        "subtitles": subtitles,
-        "subtitle_count": len(subtitles)
+        "master_url": master_url,
+        "qualities": qualities
     }), 200
 
 if __name__ == '__main__':
